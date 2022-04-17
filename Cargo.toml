@@ -58,6 +58,7 @@ thiserror = "1.0.22"
 tiny_http = "0.10.0"
 uuid = { version = "0.8.1", features = ["v4"] }
 walkdir = "2.3.1"
+tokio = { version = "1.17.0", features = ["full"] }
 
 [build-dependencies]
 protoc-grpcio = "3.0.0"

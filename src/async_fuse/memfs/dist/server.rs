@@ -14,9 +14,11 @@ use crate::async_fuse::memfs::RenameParam;
 use log::debug;
 use std::fmt::{self, Debug};
 use std::net::IpAddr;
-use std::net::{TcpListener, TcpStream};
+// use std::net::{TcpListener, TcpStream};
 use std::sync::Arc;
-use std::thread::{self, JoinHandle};
+use tokio::net::{TcpListener, TcpStream};
+// use std::thread;
+// use tokio::task;
 
 /// Distributed cache server
 pub struct CacheServer {
@@ -24,8 +26,8 @@ pub struct CacheServer {
     ip: String,
     /// Port number
     port: String,
-    /// Server thread handler
-    th: Option<JoinHandle<bool>>,
+    // Server thread handler
+    // th: Option<thread::JoinHandle<task::JoinHandle<bool>>>,
 }
 
 impl Debug for CacheServer {
@@ -39,26 +41,31 @@ impl Debug for CacheServer {
 
 impl Drop for CacheServer {
     fn drop(&mut self) {
-        let mut connect =
-            TcpStream::connect(format!("{}:{}", self.ip, self.port)).unwrap_or_else(|e| {
-                panic!(
-                    "Connect to local service {}:{} failed, error: {}",
-                    self.ip, self.port, e
-                )
-            });
-        if let Err(e) = tcp::write_message(&mut connect, request::turnoff().as_slice()) {
-            panic!("Fail to send turn off request, {}", e);
-        }
-        self.th
-            .take()
-            .unwrap_or_else(|| panic!("Th in Cache server is None"))
-            .join()
-            .unwrap_or_else(|e| {
-                panic!(
-                    "join failed while waiting for cache server termination, {:?}",
-                    e
-                )
-            });
+        let (ip, port) = (self.ip.clone(), self.port.clone());
+        tokio::spawn(async move {
+            let mut connect = TcpStream::connect(format!("{}:{}", ip, port))
+                .await
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "Connect to local service {}:{} failed, error: {}",
+                        ip, port, e
+                    )
+                });
+            if let Err(e) = tcp::write_message(&mut connect, request::turnoff().as_slice()).await {
+                panic!("Fail to send turn off request, {}", e);
+            }
+        });
+        // TODO: 确保th执行完
+        // self.th
+        //     .take()
+        //     .unwrap_or_else(|| panic!("Th in Cache server is None"))
+        //     .join()
+        //     .unwrap_or_else(|e| {
+        //         panic!(
+        //             "join failed while waiting for cache server termination, {:?}",
+        //             e
+        //         )
+        //     });
     }
 }
 
@@ -76,22 +83,23 @@ impl CacheServer {
             .parse()
             .unwrap_or_else(|e| panic!("Failed to parse ip {}, error is {}", ip, e));
 
-        let th = thread::spawn(move || {
-            let listener =
-                TcpListener::bind(format!("{}:{}", ip_copy, port_copy)).unwrap_or_else(|e| {
+        let _th = tokio::spawn(async move {
+            let listener = TcpListener::bind(format!("{}:{}", ip_copy, port_copy))
+                .await
+                .unwrap_or_else(|e| {
                     panic!(
                         "Fail to bind tcp listener to {}:{}, error is {}",
                         ip_copy, port_copy, e
                     )
                 });
             loop {
-                match listener.accept() {
+                match listener.accept().await {
                     Ok((stream, addr)) => {
                         // Receive connection from local means to turnoff server.
                         if addr.ip() == ip_addr {
                             let mut buf = Vec::new();
                             let mut local_stream = stream;
-                            if let Err(e) = tcp::read_message(&mut local_stream, &mut buf) {
+                            if let Err(e) = tcp::read_message(&mut local_stream, &mut buf).await {
                                 panic!(
                                     "fail to read distributed cache request from tcp stream, {}",
                                     e
@@ -100,7 +108,7 @@ impl CacheServer {
 
                             let request = request::deserialize_cache(buf.as_slice());
                             if let DistRequest::TurnOff = request {
-                                turnoff(&mut local_stream).unwrap_or_else(|e| {
+                                turnoff(&mut local_stream).await.unwrap_or_else(|e| {
                                     panic!("failed to send turnoff reply, error is {}", e)
                                 });
                                 return true;
@@ -131,7 +139,7 @@ impl CacheServer {
         Self {
             ip,
             port,
-            th: Some(th),
+            // th: Some(th),
         }
     }
 }
@@ -143,7 +151,7 @@ async fn dispatch<S: S3BackEnd + Send + Sync + 'static>(
     meta: Arc<S3MetaData<S>>,
 ) -> anyhow::Result<bool> {
     let mut buf = Vec::new();
-    if let Err(e) = tcp::read_message(stream, &mut buf) {
+    if let Err(e) = tcp::read_message(stream, &mut buf).await {
         panic!(
             "fail to read distributed cache request from tcp stream, {}",
             e
@@ -154,21 +162,21 @@ async fn dispatch<S: S3BackEnd + Send + Sync + 'static>(
 
     match request {
         DistRequest::TurnOff => {
-            turnoff(stream)?;
+            turnoff(stream).await?;
             Ok(false)
         }
         DistRequest::Invalidate(args) => {
-            invalidate(stream, &cache, args)?;
+            invalidate(stream, &cache, args).await?;
             Ok(true)
         }
 
         DistRequest::CheckAvailable(args) => {
-            check_available(stream, &cache, args)?;
+            check_available(stream, &cache, args).await?;
             Ok(true)
         }
 
         DistRequest::Read(args) => {
-            read(stream, &cache, args)?;
+            read(stream, &cache, args).await?;
             Ok(true)
         }
         DistRequest::LoadDir(path) => {
@@ -200,31 +208,31 @@ async fn dispatch<S: S3BackEnd + Send + Sync + 'static>(
             Ok(true)
         }
         DistRequest::GetInodeNum => {
-            get_inode_num(stream, &meta)?;
+            get_inode_num(stream, &meta).await?;
             Ok(true)
         }
     }
 }
 
 /// Handle `TurnOff` request
-fn turnoff(stream: &mut TcpStream) -> anyhow::Result<()> {
-    tcp::write_message(stream, response::turnoff().as_slice())?;
+async fn turnoff(stream: &mut TcpStream) -> anyhow::Result<()> {
+    tcp::write_message(stream, response::turnoff().as_slice()).await?;
     Ok(())
 }
 
 /// Handle `Invalidate` request
-fn invalidate(
+async fn invalidate(
     stream: &mut TcpStream,
     cache: &Arc<GlobalCache>,
     args: OpArgs,
 ) -> anyhow::Result<()> {
     cache.invalidate(args.file_name.as_slice(), args.index);
-    tcp::write_message(stream, response::invalidate().as_slice())?;
+    tcp::write_message(stream, response::invalidate().as_slice()).await?;
     Ok(())
 }
 
 /// Handle `CheckAvailable` request
-fn check_available(
+async fn check_available(
     stream: &mut TcpStream,
     cache: &Arc<GlobalCache>,
     args: OpArgs,
@@ -234,17 +242,22 @@ fn check_available(
         tcp::write_message(
             stream,
             response::check_available(&Some(available.0)).as_slice(),
-        )?;
+        )
+        .await?;
     } else {
-        tcp::write_message(stream, response::check_available(&None).as_slice())?;
+        tcp::write_message(stream, response::check_available(&None).as_slice()).await?;
     }
     Ok(())
 }
 
 /// Handle `Read` request
-fn read(stream: &mut TcpStream, cache: &Arc<GlobalCache>, args: OpArgs) -> anyhow::Result<()> {
+async fn read(
+    stream: &mut TcpStream,
+    cache: &Arc<GlobalCache>,
+    args: OpArgs,
+) -> anyhow::Result<()> {
     let data = cache.read(args.file_name.as_slice(), args.index);
-    tcp::write_message_vector(stream, data)?;
+    tcp::write_message_vector(stream, data).await?;
     Ok(())
 }
 
@@ -260,11 +273,12 @@ async fn load_dir<S: S3BackEnd + Send + Sync + 'static>(
     };
 
     match inum_opt {
-        None => tcp::write_message(stream, response::load_dir_none().as_slice())?,
+        None => tcp::write_message(stream, response::load_dir_none().as_slice()).await?,
         Some(inum) => match meta.cache.read().await.get(&inum) {
-            None => tcp::write_message(stream, response::load_dir_none().as_slice())?,
+            None => tcp::write_message(stream, response::load_dir_none().as_slice()).await?,
             Some(node) => {
-                tcp::write_message(stream, response::load_dir(node.get_dir_data()).as_slice())?
+                tcp::write_message(stream, response::load_dir(node.get_dir_data()).as_slice())
+                    .await?
             }
         },
     };
@@ -303,7 +317,7 @@ async fn update_dir<S: S3BackEnd + Send + Sync + 'static>(
             cache.insert(child_ino, child_node);
         }
     }
-    tcp::write_message(stream, &response::update_dir())?;
+    tcp::write_message(stream, &response::update_dir()).await?;
     Ok(())
 }
 
@@ -322,7 +336,7 @@ async fn remove_dir_entry<S: S3BackEnd + Send + Sync + 'static>(
             parent_node.get_dir_data_mut().remove(&args.child_name);
         }
     }
-    tcp::write_message(stream, &response::update_dir())?;
+    tcp::write_message(stream, &response::update_dir()).await?;
     Ok(())
 }
 
@@ -341,7 +355,7 @@ async fn get_attr<S: S3BackEnd + Send + Sync + 'static>(
         if let Some(node) = cache.get(&inum) {
             let attr = node.get_attr();
             debug!("Success get attr for path {} .", path);
-            tcp::write_message(stream, &response::get_attr(&attr))?;
+            tcp::write_message(stream, &response::get_attr(&attr)).await?;
             return Ok(());
         }
         debug!(
@@ -353,7 +367,7 @@ async fn get_attr<S: S3BackEnd + Send + Sync + 'static>(
         debug!("path {} is not find in path2inum.", path,);
     }
 
-    tcp::write_message(stream, &response::get_attr_none())?;
+    tcp::write_message(stream, &response::get_attr_none()).await?;
     Ok(())
 }
 
@@ -379,7 +393,7 @@ async fn push_attr<S: S3BackEnd + Send + Sync + 'static>(
         }
     }
 
-    tcp::write_message(stream, &response::push_attr())?;
+    tcp::write_message(stream, &response::push_attr()).await?;
     Ok(())
 }
 
@@ -390,7 +404,7 @@ async fn rename<S: S3BackEnd + Send + Sync + 'static>(
     args: RenameParam,
 ) -> anyhow::Result<()> {
     meta.rename_local(&args, true).await;
-    tcp::write_message(stream, &response::rename())?;
+    tcp::write_message(stream, &response::rename()).await?;
     Ok(())
 }
 
@@ -415,16 +429,16 @@ async fn remove<S: S3BackEnd + Send + Sync + 'static>(
             args.parent, args.child_name, e,
         );
     }
-    tcp::write_message(stream, &response::remove())?;
+    tcp::write_message(stream, &response::remove()).await?;
     Ok(())
 }
 
 /// Handle `GetInodeNum` request
-fn get_inode_num<S: S3BackEnd + Send + Sync + 'static>(
+async fn get_inode_num<S: S3BackEnd + Send + Sync + 'static>(
     stream: &mut TcpStream,
     meta: &Arc<S3MetaData<S>>,
 ) -> anyhow::Result<()> {
     let inum = meta.cur_inum();
-    tcp::write_u32(stream, inum)?;
+    tcp::write_u32(stream, inum).await?;
     Ok(())
 }

@@ -550,7 +550,8 @@ fn parse_args() -> ArgMatches {
 }
 
 #[allow(clippy::too_many_lines)]
-fn main() -> anyhow::Result<()> {
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
     env_logger::init();
 
     let matches = parse_args();
